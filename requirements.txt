@@ -1,5 +1,8 @@
 streamlit
 pandas
-openpyxl
+numpy
 plotly
+openpyxl
 st-gsheets-connection
+python-docx
+fpdf2

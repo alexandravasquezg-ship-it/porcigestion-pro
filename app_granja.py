@@ -173,18 +173,20 @@ def aplicar_validaciones_excel(writer):
 def cargar_datos():
     base = crear_estructura_base()
     if USAR_GSHEETS:
-        datos = {}
-        for hoja, df_def in base.items():
-            try:
-                df_leido = conn.read(worksheet=hoja, ttl=0)
-                if df_leido is None or df_leido.empty:
-                    conn.update(worksheet=hoja, data=df_def)
-                    datos[hoja] = df_def
-                else:
-                    datos[hoja] = df_leido.dropna(how="all")
-            except Exception:
-                datos[hoja] = df_def
-        return datos
+        if "db_nube" not in st.session_state:
+            datos = {}
+            for hoja, df_def in base.items():
+                try:
+                    df_leido = conn.read(worksheet=hoja, ttl=300)
+                    if df_leido is None or df_leido.empty:
+                        conn.update(worksheet=hoja, data=df_def)
+                        datos[hoja] = df_def.copy()
+                    else:
+                        datos[hoja] = df_leido.dropna(how="all")
+                except Exception:
+                    datos[hoja] = df_def.copy()
+            st.session_state["db_nube"] = datos
+        return {k: v.copy() for k, v in st.session_state["db_nube"].items()}
     else:
         if not os.path.exists(ARCHIVO_EXCEL):
             with pd.ExcelWriter(ARCHIVO_EXCEL, engine='openpyxl') as writer:
@@ -194,10 +196,17 @@ def cargar_datos():
         xls = pd.ExcelFile(ARCHIVO_EXCEL)
         return {sheet: pd.read_excel(xls, sheet) for sheet in xls.sheet_names}
 
-def guardar_datos(dfs):
+def guardar_datos(dfs, hoja_modificada=None):
     if USAR_GSHEETS:
-        for hoja, df in dfs.items():
-            conn.update(worksheet=hoja, data=df)
+        anterior = st.session_state.get("db_nube", {})
+        if hoja_modificada and hoja_modificada in dfs:
+            conn.update(worksheet=hoja_modificada, data=dfs[hoja_modificada])
+        else:
+            for hoja, df in dfs.items():
+                df_ant = anterior.get(hoja)
+                if df_ant is None or not df.equals(df_ant):
+                    conn.update(worksheet=hoja, data=df)
+        st.session_state["db_nube"] = {k: v.copy() for k, v in dfs.items()}
     else:
         with pd.ExcelWriter(ARCHIVO_EXCEL, engine='openpyxl') as writer:
             for sheet, df in dfs.items():
@@ -213,6 +222,12 @@ with st.sidebar:
     modo_txt = "☁️ Nube (Google Sheets)" if USAR_GSHEETS else "💻 Local (Excel)"
     st.caption(f"Conexión: {modo_txt}")
     st.caption(f"Perfil: **{'Administrador' if st.session_state.rol == 'admin' else 'Operario'}**")
+    if USAR_GSHEETS:
+        if st.button("🔄 Sincronizar con Google Sheets", use_container_width=True):
+            st.cache_data.clear()
+            if "db_nube" in st.session_state:
+                del st.session_state["db_nube"]
+            st.rerun()
     st.divider()
 
     menu_opciones = [

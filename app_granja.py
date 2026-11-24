@@ -13,7 +13,7 @@ from fpdf import FPDF
 
 st.set_page_config(
     page_title="PorciGestión Pro | Control Integral Porcino",
-    page_icon="🐷",
+    page_icon="🐽",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -173,7 +173,10 @@ if not st.session_state["autenticado"]:
     col_l1, col_l2, col_l3 = st.columns([1, 1.4, 1])
     with col_l2:
         st.markdown("<br>", unsafe_allow_html=True)
-        st.image("https://img.icons8.com/color/96/pig.png", width=85)
+        st.markdown(
+            '<div style="font-size: 135px; line-height: 1.1; margin-bottom: 10px;">🐽</div>',
+            unsafe_allow_html=True
+        )
         st.markdown('<div class="main-header">PorciGestión Pro</div>', unsafe_allow_html=True)
         st.markdown('<div class="sub-header">Sistema Inteligente de Administración y Analítica Porcina</div>', unsafe_allow_html=True)
 
@@ -203,7 +206,10 @@ es_admin = (st.session_state["rol_usuario"] == "admin")
 
 # Barra lateral según el perfil autenticado
 with st.sidebar:
-    st.image("https://img.icons8.com/color/96/pig.png", width=70)
+    st.markdown(
+        '<div style="font-size: 115px; line-height: 1.1; margin-bottom: 5px;">🐽</div>',
+        unsafe_allow_html=True
+    )
     st.title("PorciGestión Pro")
     if es_admin:
         st.success("👑 Perfil: **Administrador**")

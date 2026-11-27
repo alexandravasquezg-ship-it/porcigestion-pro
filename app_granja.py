@@ -1,9 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from streamlit_gsheets import GSheetsConnection
 from io import BytesIO
 from docx import Document
@@ -132,7 +131,7 @@ def asegurar_columnas(df, cols):
             df[c] = ""
     return df[cols]
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=15)
 def cargar_datos_seguros():
     datos = {}
     errores = []
@@ -156,6 +155,27 @@ def guardar_hoja(hoja, df):
     conn.update(worksheet=hoja, data=df_clean)
     st.cache_data.clear()
 
+def guardar_hojas_seguro(pares_hoja_df):
+    """Guarda múltiples hojas informando exactamente qué hoja falló si ocurre un corte de red o cuota."""
+    if st.session_state.get("lectura_corrupta", False):
+        st.error("🚫 Guardado bloqueado por seguridad: hubo un error al leer Google Sheets.")
+        st.stop()
+    guardadas = []
+    for hoja, df in pares_hoja_df:
+        try:
+            df_clean = asegurar_columnas(df.copy(), ESQUEMA_HOJAS[hoja])
+            conn.update(worksheet=hoja, data=df_clean)
+            guardadas.append(hoja)
+        except Exception as e:
+            st.cache_data.clear()
+            st.error(
+                f"🚨 Error al guardar la hoja **'{hoja}'**: {e}\n\n"
+                f"Hojas ya guardadas en esta operación: `{guardadas if guardadas else 'Ninguna'}`. "
+                f"Sincroniza con Google Sheets antes de reintentar para evitar duplicados."
+            )
+            st.stop()
+    st.cache_data.clear()
+
 def generar_siguiente_id(df, col_id, prefijo):
     max_num = 0
     if df is not None and not df.empty and col_id in df.columns:
@@ -164,6 +184,15 @@ def generar_siguiente_id(df, col_id, prefijo):
             if m:
                 max_num = max(max_num, int(m.group(1)))
     return f"{prefijo}-{max_num + 1:03d}"
+
+def generar_numero_lote_siguiente(df_l):
+    max_num = 0
+    if df_l is not None and not df_l.empty and "ID_Lote" in df_l.columns:
+        for val in df_l["ID_Lote"].dropna().astype(str):
+            m = re.search(r"LOTE-(\d+)", val.strip(), flags=re.IGNORECASE)
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+    return max_num + 1
 
 def to_num(series, default=0.0):
     return pd.to_numeric(series, errors="coerce").fillna(default)
@@ -254,7 +283,6 @@ def evaluar_fase_lote(lote_row, df_cons, hoy_date, edad_dest, peso_dest, fases_d
     else:
         info_f = info_edad
 
-    # Población efectiva promedio para evitar saltos artificiales por bajas o ventas parciales
     poblacion_efectiva = max((cant_ini + cant_act) / 2.0, float(cant_act), 1.0)
     kg_meta_fase_lote = round(info_f["kg_cerdo"] * poblacion_efectiva, 1)
 
@@ -276,18 +304,19 @@ def evaluar_fase_lote(lote_row, df_cons, hoy_date, edad_dest, peso_dest, fases_d
         "peso_objetivo_fin_fase": info_f["peso_fin"]
     }
 
-def calcular_fifo_bodega(df_bod, cat, nombre, pres, unidad, cantidad_requerida):
+def calcular_fifo_bodega(df_bod, cat, nombre, pres, unidad, cantidad_requerida, contenido_unidad=None):
     """Calcula el costo real exacto FIFO de una salida antes y durante la confirmación."""
-    sub = df_bod[
+    cond = (
         (df_bod["Categoria_Insumo"].astype(str).str.strip() == cat) &
         (df_bod["Nombre_Insumo"].astype(str).str.strip() == nombre) &
         (df_bod["Presentacion"].astype(str).str.strip() == pres) &
         (df_bod["Unidad_Medida"].astype(str).str.strip() == unidad) &
         (to_num(df_bod["Saldo_Disponible"]) > 0)
-    ]
-    # FIFO real: ordenar primero por fecha de compra y, en empate, por ID.
-    # Si la fecha es inválida, se coloca al final para no consumirla antes que lotes fechados.
-    sub = sub.copy()
+    )
+    if contenido_unidad is not None:
+        cond = cond & (np.isclose(to_num(df_bod["Contenido_Por_Unidad"]), float(contenido_unidad), atol=1e-3))
+
+    sub = df_bod[cond].copy()
     sub["_fecha_fifo"] = pd.to_datetime(sub["Fecha"], errors="coerce")
     sub["_id_fifo"] = sub["ID_Compra"].astype(str).str.strip()
     sub = sub.sort_values(["_fecha_fifo", "_id_fifo"], kind="stable", na_position="last")
@@ -364,7 +393,6 @@ if "rol_usuario" not in st.session_state:
 try:
     ADMIN_PASS_REAL = st.secrets.get("admin_password", "admin123")
 except Exception:
-    # Streamlit puede no tener secrets.toml configurado; se conserva el fallback previo.
     ADMIN_PASS_REAL = "admin123"
 
 if not st.session_state["autenticado"]:
@@ -447,14 +475,20 @@ with st.sidebar:
 # ==============================================================================
 ESTADOS_INACTIVOS_REP = {"Descartada / Vendida", "Muerta", "Descartada"}
 
-hembras_activas_df = df_rep[
-    (df_rep["Tipo"].astype(str).str.contains("Hembra", na=False)) &
-    (~df_rep["Estado"].astype(str).str.strip().isin(ESTADOS_INACTIVOS_REP))
+reproductores_activos_df = df_rep[
+    ~df_rep["Estado"].astype(str).str.strip().isin(ESTADOS_INACTIVOS_REP)
 ].copy() if not df_rep.empty else pd.DataFrame()
+
+hembras_activas_df = reproductores_activos_df[
+    reproductores_activos_df["Tipo"].astype(str).str.contains("Hembra", na=False)
+].copy() if not reproductores_activos_df.empty else pd.DataFrame()
+
+verracos_activos_df = reproductores_activos_df[
+    reproductores_activos_df["Tipo"].astype(str).str.contains("Verraco", na=False)
+].copy() if not reproductores_activos_df.empty else pd.DataFrame()
 
 madres_activas_tot = len(hembras_activas_df)
 
-# Eventos reproductivos abiertos por cerda
 eventos_abiertos_df = df_repro[
     df_repro["Estado_Prenez"].astype(str).str.strip().isin(["Pendiente Eco", "Preñada", "En Lactancia"])
 ].copy() if not df_repro.empty else pd.DataFrame()
@@ -532,14 +566,14 @@ if not df_sanidad.empty:
 
 if not df_bodega.empty:
     df_bodega["Saldo_Num"] = to_num(df_bodega["Saldo_Disponible"])
-    resumen_stock = df_bodega.groupby(["Categoria_Insumo", "Nombre_Insumo", "Presentacion", "Unidad_Medida"], as_index=False)["Saldo_Num"].sum()
+    resumen_stock = df_bodega.groupby(["Categoria_Insumo", "Nombre_Insumo", "Unidad_Medida"], as_index=False)["Saldo_Num"].sum()
     for _, st_row in resumen_stock.iterrows():
         if st_row["Categoria_Insumo"] == "Concentrado" and st_row["Saldo_Num"] < 120:
-            alertas_preventivas.append(f"🌾 **Stock Bajo Concentrado ({st_row['Nombre_Insumo']}):** Quedan **{st_row['Saldo_Num']:.1f} kg** ({st_row['Saldo_Num']/40:.1f} bultos).")
+            alertas_preventivas.append(f"🌾 **Stock Bajo Concentrado ({st_row['Nombre_Insumo']}):** Quedan **{st_row['Saldo_Num']:.1f} kg** ({st_row['Saldo_Num']/40:.1f} bultos de 40 kg).")
         elif st_row["Categoria_Insumo"] != "Concentrado" and st_row["Saldo_Num"] < 20:
-            alertas_preventivas.append(f"💊 **Botiquín Bajo ({st_row['Nombre_Insumo']} - {st_row['Presentacion']}):** Quedan **{st_row['Saldo_Num']:.1f} {st_row['Unidad_Medida']}**.")
+            alertas_preventivas.append(f"💊 **Botiquín Bajo ({st_row['Nombre_Insumo']}):** Quedan **{st_row['Saldo_Num']:.1f} {st_row['Unidad_Medida']}**.")
 
-# Ventas últimos 30 días (validando 0 <= (hoy - fecha) <= 30 para ignorar fechas futuras)
+# Ventas últimos 30 días (validando 0 <= (hoy - fecha) <= 30)
 cerdos_vendidos_30d = 0
 utilidad_cerdos_30d = 0.0
 utilidad_prom_por_cerdo_hist = 0.0
@@ -604,7 +638,7 @@ if menu == "🚨 Tablero de Alertas":
 elif menu == "🔮 Simulador y Proyección a Metas":
     st.markdown('<div class="main-header">🔮 Simulador Realista de Crecimiento y Diagnóstico</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sub-header">Proyección simplificada: las madres actuales se consideran en régimen productivo; las madres añadidas se incorporan con rezago de 9 meses. No reemplaza un modelo individual de servicios, partos, destetes y mortalidad.</div>',
+        '<div class="sub-header">Proyección financiera y biológica con rezago de 9 meses para madres incorporadas (gestación + ceba).</div>',
         unsafe_allow_html=True
     )
 
@@ -648,13 +682,11 @@ elif menu == "🔮 Simulador y Proyección a Metas":
 
     filas_sim = []
     madres_act_m = float(madres_base_sim)
-    # Desembolso real de compra inicial en Mes 1
     inversion_inicial_madres = cerdas_comprar_ya * COSTO_CERDA_REEMPLAZO
     caja_sim = float(aporte_socio_sim) - inversion_inicial_madres
     caja_minima = caja_sim
     mes_logro_meta = None
 
-    # Historial mensual de madres activas para aplicar rezago aproximado de 9 meses (gestación + engorde)
     historial_madres = [float(madres_base_sim)]
 
     for m in range(0, 25):
@@ -664,19 +696,16 @@ elif menu == "🔮 Simulador y Proyección a Metas":
             egreso_madres_m = inversion_inicial_madres
         elif m >= 2 and madres_act_m < madres_necesarias_meta:
             if "Acelerada" in estrategia_crec:
-                # Solo compra otra cerda si hay flujo positivo real en caja
                 if m % 2 == 0 and caja_sim >= COSTO_CERDA_REEMPLAZO + 2500000:
                     madres_act_m = min(madres_act_m + 1, madres_necesarias_meta)
                     caja_sim -= COSTO_CERDA_REEMPLAZO
                     egreso_madres_m = COSTO_CERDA_REEMPLAZO
             elif "Mixta" in estrategia_crec:
-                # Primerizas retenidas tardan 7 meses en entrar a servicio (costo crianza ~$650.000)
                 if m >= 7 and m % 2 == 1 and caja_sim >= 1500000:
                     madres_act_m = min(madres_act_m + 1, madres_necesarias_meta)
                     caja_sim -= 650000.0
                     egreso_madres_m = 650000.0
             else:
-                # Orgánica pura: solo retiene si hubo partos previos suficientes
                 if m >= 7 and historial_madres[m - 7] >= 2 and caja_sim >= 1500000:
                     madres_act_m = min(madres_act_m + 1, madres_necesarias_meta)
                     caja_sim -= 650000.0
@@ -684,7 +713,6 @@ elif menu == "🔮 Simulador y Proyección a Metas":
 
         historial_madres.append(madres_act_m)
 
-        # Las ventas del mes m provienen de las madres que estaban en servicio 9 meses atrás
         madres_que_producen_venta = historial_madres[max(0, m - 9)]
         cerdos_vendidos_m = int(round(madres_que_producen_venta * cerdos_mes_por_madre))
 
@@ -775,7 +803,6 @@ elif menu == "💼 Salud Financiera y Reinversión":
     aportes_socio = 0.0
     capex_total = 0.0
     gastos_fijos_tot = 0.0
-    reinversion_registrada = 0.0
     retiros_ganancia = 0.0
 
     if not df_inv.empty:
@@ -786,29 +813,24 @@ elif menu == "💼 Salud Financiera y Reinversión":
                 aportes_socio += monto
             elif t_mov == "Inversión Infraestructura / Activos":
                 capex_total += monto
-            elif t_mov == "Reinversión en Inventario / Operaciones":
-                reinversion_registrada += monto
             elif t_mov == "Gasto Fijo Operativo":
                 gastos_fijos_tot += monto
             elif t_mov == "Retiro de Utilidades (Ganancia Socio)":
                 retiros_ganancia += monto
 
-    # Desembolsos reales en compras de bodega y servicios reproductivos
     compras_bodega_tot = float((to_num(df_bodega["Unidades_Compradas"]) * to_num(df_bodega["Precio_Unitario"])).sum()) if not df_bodega.empty else 0.0
     servicios_ia_tot = float(to_num(df_repro["Costo_Servicio"]).sum()) if not df_repro.empty else 0.0
     valor_inventario_actual = float((to_num(df_bodega["Saldo_Disponible"]) * to_num(df_bodega["Costo_Por_Medida"])).sum()) if not df_bodega.empty else 0.0
 
-    # Ecuación real de flujo de efectivo (sin doble conteo de reinversiones)
     entradas_efectivo = aportes_socio + ingresos_brutos_totales
     salidas_efectivo = capex_total + compras_bodega_tot + servicios_ia_tot + fletes_sacrificio_totales + gastos_fijos_tot + retiros_ganancia
     caja_real_disponible = entradas_efectivo - salidas_efectivo
 
-    # Utilidad contable neta integral (descontando gastos fijos operativos)
     utilidad_contable_neta = util_bruta_ventas - gastos_fijos_tot
     tot_cerdos_v = float(to_num(df_ventas[df_ventas["Linea_Negocio"].astype(str).str.contains("Cebados", na=False)]["Cantidad_Animales_O_Unidades"]).sum()) if not df_ventas.empty else 0.0
     util_integral_por_cerdo = (utilidad_contable_neta / tot_cerdos_v) if tot_cerdos_v > 0 else 0.0
 
-    st.subheader("💵 Flujo de Caja Registrado (Estimado) vs. Rentabilidad Registrada")
+    st.subheader("💵 Flujo de Caja Registrado vs. Rentabilidad")
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("🏦 Caja Registrada Estimada", f"${caja_real_disponible:,.0f}", delta="Según movimientos registrados")
     k2.metric("📦 Valor Inventario Bodega", f"${valor_inventario_actual:,.0f}")
@@ -942,7 +964,7 @@ elif menu == "📅 Escalonamiento y Bandas":
                 "Parto (114d)": f_par.strftime("%Y-%m-%d"),
                 f"Destete ({EDAD_DESTETE}d)": f_des.strftime("%Y-%m-%d"),
                 "Re-Servicio (+5d)": f_reins.strftime("%Y-%m-%d"),
-                f"Salida 120kg ({EDAD_META}d)": f_venta.strftime("%Y-%m-%d")
+                f"Salida {PESO_META:.0f}kg ({EDAD_META}d)": f_venta.strftime("%Y-%m-%d")
             })
         st.dataframe(pd.DataFrame(filas_cron), use_container_width=True, hide_index=True)
 
@@ -970,7 +992,7 @@ elif menu == "📅 Escalonamiento y Bandas":
                 if st.button("🪄 Distribuir Respetando Cupo Máximo"):
                     idx_h = hembras_activas_df.index.tolist()
                     asignadas = 0
-                    for i, row_idx in enumerate(idx_h):
+                    for row_idx in idx_h:
                         if asignadas < capacidad_total_granja:
                             df_rep.at[row_idx, "Banda"] = lista_bandas[asignadas % NUM_BANDAS]
                             asignadas += 1
@@ -989,15 +1011,13 @@ elif menu == "📅 Escalonamiento y Bandas":
 elif menu == "🧬 Reproducción (IA y Partos)":
     st.markdown('<div class="main-header">🧬 Gestión Reproductiva (Inseminación Artificial)</div>', unsafe_allow_html=True)
 
-    # SOLO cerdas en estado 'Vacía' y SIN ningún evento reproductivo abierto
     cerdas_elegibles_ia_df = hembras_activas_df[
         (hembras_activas_df["Estado"].astype(str).str.strip() == "Vacía") &
         (~hembras_activas_df["ID_Animal"].astype(str).str.strip().isin(cerdas_con_ciclo_abierto))
     ] if not hembras_activas_df.empty else pd.DataFrame()
 
     lista_hembras_ia = opciones_limpias(cerdas_elegibles_ia_df["ID_Animal"]) if not cerdas_elegibles_ia_df.empty else []
-    verracos_activos = df_rep[(df_rep["Tipo"].astype(str).str.contains("Verraco", na=False)) & (~df_rep["Estado"].astype(str).str.strip().isin(ESTADOS_INACTIVOS_REP))] if not df_rep.empty else pd.DataFrame()
-    verracos_lista = opciones_limpias(verracos_activos["ID_Animal"]) if not verracos_activos.empty else []
+    verracos_lista = opciones_limpias(verracos_activos_df["ID_Animal"]) if not verracos_activos_df.empty else []
     opciones_recelador = [f"Sí ({v})" for v in verracos_lista] + ["Sí (Verraco Externo)", "No"] if verracos_lista else ["Sí (Verraco Externo)", "No"]
 
     t1, t2, t3, t4 = st.tabs(["1️⃣ Registrar Inseminación", "2️⃣ Confirmar Preñez / Falla", "3️⃣ Registrar Parto", f"4️⃣ Registrar Destete ({EDAD_DESTETE}d)"])
@@ -1020,7 +1040,6 @@ elif menu == "🧬 Reproducción (IA y Partos)":
 
             f_parto_est = f_serv + timedelta(days=114)
             if st.button("💾 Guardar Inseminación"):
-                # Doble verificación contra concurrencia
                 if cerda_ia in cerdas_con_ciclo_abierto:
                     st.error(f"🚫 {cerda_ia} ya tiene un ciclo reproductivo abierto.")
                 else:
@@ -1052,8 +1071,7 @@ elif menu == "🧬 Reproducción (IA y Partos)":
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_ia, "Estado"] = "Inseminada"
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_ia, "Fecha_Ultimo_Cambio_Estado"] = f_serv.strftime("%Y-%m-%d")
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_ia, "Costo_Acumulado_Ciclo"] = to_num(df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_ia, "Costo_Acumulado_Ciclo"]) + costo_ia
-                    guardar_hoja("Reproduccion", df_repro)
-                    guardar_hoja("Reproductores", df_rep)
+                    guardar_hojas_seguro([("Reproduccion", df_repro), ("Reproductores", df_rep)])
                     st.success(f"Servicio {nuevo_id} registrado para {cerda_ia}. Parto probable: {f_parto_est}.")
                     st.rerun()
 
@@ -1088,8 +1106,7 @@ elif menu == "🧬 Reproducción (IA y Partos)":
                         df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Repeticiones"] = to_num(df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Repeticiones"]) + 1
                     elif res_eco == "Aborto":
                         df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Abortos"] = to_num(df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Abortos"]) + 1
-                guardar_hoja("Reproduccion", df_repro)
-                guardar_hoja("Reproductores", df_rep)
+                guardar_hojas_seguro([("Reproduccion", df_repro), ("Reproductores", df_rep)])
                 st.success("Estado reproductivo actualizado.")
                 st.rerun()
 
@@ -1106,8 +1123,8 @@ elif menu == "🧬 Reproducción (IA y Partos)":
             f_parto_r = c1.date_input("Fecha Real de Parto", value=hoy)
             vivos = c2.number_input("Nacidos Vivos", min_value=1, max_value=25, value=12)
             mortinatos = c3.number_input("Mortinatos / Momias", min_value=0, max_value=10, value=0)
-            sig_lote_num = len(df_lotes) + 1
-            nombre_lote = st.text_input("Nombre del Nuevo Lote", value=f"LOTE-{sig_lote_num:02d}-{str(fila_p['ID_Cerda']).strip()}")
+            sig_lote_num = generar_numero_lote_siguiente(df_lotes)
+            nombre_lote = st.text_input("Nombre del Nuevo Lote", value=f"LOTE-{sig_lote_num:03d}-{str(fila_p['ID_Cerda']).strip()}")
             corral_parto = st.text_input("Corral / Paridera", value=f"Paridera-{str(fila_p['ID_Cerda']).strip()}")
 
             if st.button("💾 Registrar Parto y Crear Lote Lactante"):
@@ -1150,9 +1167,7 @@ elif menu == "🧬 Reproducción (IA y Partos)":
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Costo_Acumulado_Ciclo"] = 0.0
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Fecha_Ultimo_Cambio_Estado"] = f_parto_r.strftime("%Y-%m-%d")
 
-                    guardar_hoja("Reproduccion", df_repro)
-                    guardar_hoja("Lotes_Engorde", df_lotes)
-                    guardar_hoja("Reproductores", df_rep)
+                    guardar_hojas_seguro([("Reproduccion", df_repro), ("Lotes_Engorde", df_lotes), ("Reproductores", df_rep)])
                     st.success(f"Parto registrado. Lote {nombre_lote} creado.")
                     st.rerun()
 
@@ -1175,24 +1190,28 @@ elif menu == "🧬 Reproducción (IA y Partos)":
                 lote_id = str(fila_d["Nombre_Lote_Asignado"]).strip()
                 costo_lact = float(to_num(df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Costo_Acumulado_Ciclo"]).iloc[0])
 
+                lote_mask = df_lotes["ID_Lote"].astype(str).str.strip() == lote_id
+                costo_prev_lote = float(to_num(df_lotes.loc[lote_mask, "Costo_Inicial_Lechones"]).sum()) + float(to_num(df_lotes.loc[lote_mask, "Costo_Sanidad"]).sum())
+                costo_total_destete = costo_prev_lote + costo_lact
+                costo_por_lechon_calc = round(costo_total_destete / max(dest_reales, 1), 0)
+
                 df_repro.loc[df_repro["ID_Evento"].astype(str).str.strip() == id_ev_d, "Estado_Prenez"] = "Destetada"
                 df_repro.loc[df_repro["ID_Evento"].astype(str).str.strip() == id_ev_d, "Destetados_Reales"] = dest_reales
                 df_repro.loc[df_repro["ID_Evento"].astype(str).str.strip() == id_ev_d, "Peso_Destete_Total_Kg"] = peso_tot_dest
+                df_repro.loc[df_repro["ID_Evento"].astype(str).str.strip() == id_ev_d, "Costo_Por_Lechon"] = costo_por_lechon_calc
 
-                df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_id, "Etapa"] = "Fase 0"
-                df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_id, "Corral"] = corral_dest
-                df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_id, "Cant_Actual"] = dest_reales
-                df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_id, "Peso_Prom_Actual_Kg"] = round(peso_tot_dest / dest_reales, 2)
-                df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_id, "Costo_Inicial_Lechones"] = to_num(df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_id, "Costo_Inicial_Lechones"]) + costo_lact
+                df_lotes.loc[lote_mask, "Etapa"] = "Fase 0"
+                df_lotes.loc[lote_mask, "Corral"] = corral_dest
+                df_lotes.loc[lote_mask, "Cant_Actual"] = dest_reales
+                df_lotes.loc[lote_mask, "Peso_Prom_Actual_Kg"] = round(peso_tot_dest / dest_reales, 2)
+                df_lotes.loc[lote_mask, "Costo_Inicial_Lechones"] = to_num(df_lotes.loc[lote_mask, "Costo_Inicial_Lechones"]) + costo_lact
 
                 df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Estado"] = "Vacía"
                 df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Costo_Acumulado_Ciclo"] = 0.0
                 df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_id, "Fecha_Ultimo_Cambio_Estado"] = hoy.strftime("%Y-%m-%d")
 
-                guardar_hoja("Reproduccion", df_repro)
-                guardar_hoja("Lotes_Engorde", df_lotes)
-                guardar_hoja("Reproductores", df_rep)
-                st.success(f"Destete completado. {lote_id} entra a Fase 0.")
+                guardar_hojas_seguro([("Reproduccion", df_repro), ("Lotes_Engorde", df_lotes), ("Reproductores", df_rep)])
+                st.success(f"Destete completado. {lote_id} entra a Fase 0 (Costo/lechón: ${costo_por_lechon_calc:,.0f}).")
                 st.rerun()
 
     st.divider()
@@ -1235,7 +1254,6 @@ elif menu == "🐖 Lotes, Curva y Fases":
             peso_esp_hoy = peso_esperado_por_edad(edad_dias, PESO_NAC, PESO_DEST_21D, EDAD_DESTETE, PROGRAMA_FASES)
             cumpl_pct = (p_act / max(peso_esp_hoy, 0.1)) * 100.0
 
-            # Conversión real considerando biomasa vendida parcialmente de este lote + biomasa viva actual - biomasa inicial
             kg_vendidos_parcial = 0.0
             if not df_ventas.empty:
                 v_parc = df_ventas[df_ventas["ID_Origen"].astype(str).str.strip() == lote_id_str]
@@ -1321,7 +1339,6 @@ elif menu == "🐖 Lotes, Curva y Fases":
                     tot_c = c1_n + c2_n
                     p_prom = (c1_n * float(to_num(pd.Series([r1["Peso_Prom_Actual_Kg"]])).iloc[0]) + c2_n * float(to_num(pd.Series([r2["Peso_Prom_Actual_Kg"]])).iloc[0])) / max(tot_c, 1)
 
-                    # 1. Consolidar tabla Lotes_Engorde
                     df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == l1, "ID_Lote"] = nuevo_nom_union
                     df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == nuevo_nom_union, "Madre_Origen"] = f"{r1['Madre_Origen']} + {r2['Madre_Origen']}"
                     df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == nuevo_nom_union, "Raza_Cruce"] = f"Mixto ({r1['Raza_Cruce']} / {r2['Raza_Cruce']})"
@@ -1334,15 +1351,12 @@ elif menu == "🐖 Lotes, Curva y Fases":
                     df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == nuevo_nom_union, "Costo_Sanidad"] = float(to_num(pd.Series([r1["Costo_Sanidad"]])).iloc[0]) + float(to_num(pd.Series([r2["Costo_Sanidad"]])).iloc[0])
                     df_lotes = df_lotes[df_lotes["ID_Lote"].astype(str).str.strip() != l2]
 
-                    # 2. Migrar historial completo en Consumo_Alimento y Sanidad_Eventos
                     if not df_consumo.empty:
                         df_consumo.loc[df_consumo["ID_Destino"].astype(str).str.strip().isin([l1, l2]), "ID_Destino"] = nuevo_nom_union
                     if not df_sanidad.empty:
                         df_sanidad.loc[df_sanidad["ID_Destino"].astype(str).str.strip().isin([l1, l2]), "ID_Destino"] = nuevo_nom_union
 
-                    guardar_hoja("Lotes_Engorde", df_lotes)
-                    guardar_hoja("Consumo_Alimento", df_consumo)
-                    guardar_hoja("Sanidad_Eventos", df_sanidad)
+                    guardar_hojas_seguro([("Lotes_Engorde", df_lotes), ("Consumo_Alimento", df_consumo), ("Sanidad_Eventos", df_sanidad)])
                     st.success(f"Lotes unidos en {nuevo_nom_union} ({tot_c} cerdos) con trazabilidad histórica completa.")
                     st.rerun()
 
@@ -1363,21 +1377,20 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
         if df_bodega.empty:
             st.info("Aún no hay productos registrados en bodega.")
         else:
-            df_bodega["Clave_Prod"] = (
+            df_bodega["Clave_Arqueo"] = (
                 df_bodega["Categoria_Insumo"].astype(str).str.strip() + " | " +
                 df_bodega["Nombre_Insumo"].astype(str).str.strip() + " (" +
-                df_bodega["Presentacion"].astype(str).str.strip() + " - " +
                 df_bodega["Unidad_Medida"].astype(str).str.strip() + ")"
             )
-            claves_unicas = opciones_limpias(df_bodega["Clave_Prod"])
-            clave_sel = st.selectbox("Seleccionar Producto Exacto (Categoría | Nombre | Presentación | Unidad):", claves_unicas)
+            claves_unicas = opciones_limpias(df_bodega["Clave_Arqueo"])
+            clave_sel = st.selectbox("Seleccionar Producto Consolidado (Categoría | Nombre | Unidad):", claves_unicas)
 
-            sub_b = df_bodega[df_bodega["Clave_Prod"] == clave_sel]
+            sub_b = df_bodega[df_bodega["Clave_Arqueo"] == clave_sel]
             cat_p = str(sub_b.iloc[0]["Categoria_Insumo"]).strip()
             nom_p = str(sub_b.iloc[0]["Nombre_Insumo"]).strip()
-            pres_p = str(sub_b.iloc[0]["Presentacion"]).strip()
+            pres_p = str(sub_b.iloc[-1]["Presentacion"]).strip()
             und_p = str(sub_b.iloc[0]["Unidad_Medida"]).strip()
-            tam_p = float(to_num(sub_b["Contenido_Por_Unidad"]).iloc[-1])
+            tam_default = float(to_num(sub_b["Contenido_Por_Unidad"]).iloc[-1])
 
             comprado_tot = float((to_num(sub_b["Unidades_Compradas"]) * to_num(sub_b["Contenido_Por_Unidad"])).sum())
             saldo_bodega_reg = float(to_num(sub_b["Saldo_Disponible"]).sum())
@@ -1386,16 +1399,30 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
             if cat_p == "Concentrado" and not df_consumo.empty:
                 consumo_int = float(to_num(df_consumo[df_consumo["Tipo_Concentrado"].astype(str).str.strip() == nom_p]["Kilos_Servidos"]).sum())
             elif cat_p != "Concentrado" and not df_sanidad.empty:
-                consumo_int = float(to_num(df_sanidad[(df_sanidad["Medicamento"].astype(str).str.strip() == nom_p) & (df_sanidad["Unidad_Medida"].astype(str).str.strip() == und_p)]["Cantidad_Aplicada"]).sum())
+                consumo_int = float(to_num(df_sanidad[
+                    (df_sanidad["Medicamento"].astype(str).str.strip() == nom_p) &
+                    (df_sanidad["Unidad_Medida"].astype(str).str.strip() == und_p)
+                ]["Cantidad_Aplicada"]).sum())
 
             vendido_ext = 0.0
             if cat_p == "Concentrado" and not df_ventas.empty:
-                v_c = df_ventas[(df_ventas["Linea_Negocio"].astype(str).str.contains("Concentrado|Cuido", na=False)) & (df_ventas["ID_Origen"].astype(str).str.strip() == nom_p)]
+                v_c = df_ventas[
+                    (df_ventas["Linea_Negocio"].astype(str).str.contains("Concentrado|Cuido", na=False)) &
+                    (df_ventas["ID_Origen"].astype(str).str.strip() == nom_p)
+                ]
                 vendido_ext = float(to_num(v_c["Peso_Pie_O_Kilos"]).sum())
 
             saldo_teorico_ecuacion = round(comprado_tot - consumo_int - vendido_ext, 2)
-            bultos_cerrados = int(saldo_teorico_ecuacion // max(tam_p, 1.0))
-            sueltos_teoricos = round(saldo_teorico_ecuacion % max(tam_p, 1.0), 2)
+
+            cf0, cf1, cf2 = st.columns(3)
+            tam_p = cf0.number_input(
+                f"Contenido por {pres_p} cerrado ({und_p})",
+                min_value=0.1,
+                value=max(tam_default, 1.0),
+                step=1.0
+            )
+            bultos_cerrados = int(max(saldo_teorico_ecuacion, 0.0) // max(tam_p, 0.1))
+            sueltos_teoricos = round(max(saldo_teorico_ecuacion, 0.0) % max(tam_p, 0.1), 2)
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("📐 Saldo Teórico (Ecuación)", f"{saldo_teorico_ecuacion:,.1f} {und_p}", delta=f"{bultos_cerrados} {pres_p}s + {sueltos_teoricos} {und_p}")
@@ -1403,7 +1430,6 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
             m3.metric("🐖 Consumo Interno Granja", f"{consumo_int:,.1f} {und_p}")
             m4.metric("🚚 Vendido a Terceros", f"{vendido_ext:,.1f} {und_p}")
 
-            cf1, cf2 = st.columns(2)
             und_fisicas = cf1.number_input(f"¿Cuántos {pres_p}s cerrados contaste físicamente?", min_value=0, value=max(bultos_cerrados, 0), step=1)
             sueltos_fisicos = cf2.number_input(f"¿Cuántos {und_p} sueltos hay en báscula/frasco abierto?", min_value=0.0, value=max(float(sueltos_teoricos), 0.0), step=0.5)
             total_fisico = (und_fisicas * tam_p) + sueltos_fisicos
@@ -1418,35 +1444,70 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
 
     with tab_b2:
         st.subheader("🍽️ Registrar Consumo Diario de Concentrado")
-        conc_disp = df_bodega[(df_bodega["Categoria_Insumo"].astype(str).str.strip() == "Concentrado") & (to_num(df_bodega["Saldo_Disponible"]) > 0)] if not df_bodega.empty else pd.DataFrame()
+        conc_disp = df_bodega[
+            (df_bodega["Categoria_Insumo"].astype(str).str.strip() == "Concentrado") &
+            (to_num(df_bodega["Saldo_Disponible"]) > 0)
+        ].copy() if not df_bodega.empty else pd.DataFrame()
+
         if conc_disp.empty:
             st.warning("No hay concentrado con saldo disponible en bodega.")
         else:
             dest_tipo = st.selectbox("Destino del Alimento", ["Lote de Engorde", "Cerda Madre / Verraco"])
-            lista_dest = opciones_limpias(lotes_activos["ID_Lote"]) if dest_tipo == "Lote de Engorde" else opciones_limpias(hembras_activas_df["ID_Animal"])
+            lista_dest = (
+                opciones_limpias(lotes_activos["ID_Lote"])
+                if dest_tipo == "Lote de Engorde"
+                else opciones_limpias(reproductores_activos_df["ID_Animal"])
+            )
             if not lista_dest:
                 st.warning("No hay animales/lotes activos para este destino.")
             else:
                 id_dest = st.selectbox("Seleccionar Destino", lista_dest)
-                tipos_conc = opciones_limpias(conc_disp["Nombre_Insumo"])
-                fase_sug = tipos_conc[0]
+                conc_disp["_ClaveServ"] = (
+                    conc_disp["Nombre_Insumo"].astype(str).str.strip() + " | " +
+                    conc_disp["Presentacion"].astype(str).str.strip() + " | " +
+                    conc_disp["Contenido_Por_Unidad"].astype(str).str.strip() + " " +
+                    conc_disp["Unidad_Medida"].astype(str).str.strip()
+                )
+                claves_conc = opciones_limpias(conc_disp["_ClaveServ"])
+                clave_sug = claves_conc[0]
+
                 if dest_tipo == "Lote de Engorde" and not lotes_activos.empty:
                     fila_ld = lotes_activos[lotes_activos["ID_Lote"].astype(str).str.strip() == id_dest].iloc[0]
                     ev_ld = evaluar_fase_lote(fila_ld, df_consumo, hoy, EDAD_DESTETE, PESO_DEST_21D, PROGRAMA_FASES)
                     st.info(f"📌 Fase registrada: **{ev_ld['fase_registrada']}** | Consumido: **{ev_ld['kg_consumidos_fase']:.1f} / {ev_ld['kg_meta_lote']:.1f} kg**")
-                    if ev_ld["fase_registrada"] in tipos_conc:
-                        fase_sug = ev_ld["fase_registrada"]
+                    for kc in claves_conc:
+                        if kc.split(" | ")[0].strip() == ev_ld["fase_registrada"]:
+                            clave_sug = kc
+                            break
 
-                t_conc_sel = st.selectbox("Concentrado a Servir", tipos_conc, index=tipos_conc.index(fase_sug) if fase_sug in tipos_conc else 0)
-                saldo_tot_c = float(to_num(conc_disp[conc_disp["Nombre_Insumo"].astype(str).str.strip() == t_conc_sel]["Saldo_Disponible"]).sum())
-                st.caption(f"Disponible real en bodega: **{saldo_tot_c:.2f} kg**")
+                clave_conc_sel = st.selectbox(
+                    "Concentrado / Presentación a Servir",
+                    claves_conc,
+                    index=claves_conc.index(clave_sug) if clave_sug in claves_conc else 0
+                )
+                sub_serv = conc_disp[conc_disp["_ClaveServ"] == clave_conc_sel]
+                t_conc_sel = str(sub_serv.iloc[0]["Nombre_Insumo"]).strip()
+                pres_serv = str(sub_serv.iloc[0]["Presentacion"]).strip()
+                und_serv = str(sub_serv.iloc[0]["Unidad_Medida"]).strip()
+                cont_serv = float(to_num(pd.Series([sub_serv.iloc[0]["Contenido_Por_Unidad"]])).iloc[0])
+                saldo_tot_c = float(to_num(sub_serv["Saldo_Disponible"]).sum())
+
+                st.caption(f"Disponible real en bodega ({pres_serv} de {cont_serv:g} {und_serv}): **{saldo_tot_c:.2f} {und_serv}**")
 
                 min_kg_val = min(0.1, saldo_tot_c)
-                kg_serv = st.number_input("Kilos Servidos (kg)", min_value=min_kg_val, max_value=saldo_tot_c, value=min(10.0, saldo_tot_c), step=0.5)
-                costo_fifo_serv, plan_desc, faltante_fifo = calcular_fifo_bodega(df_bodega, "Concentrado", t_conc_sel, "Bulto", "kg", kg_serv)
+                kg_serv = st.number_input(
+                    f"Cantidad Servida ({und_serv})",
+                    min_value=min_kg_val,
+                    max_value=saldo_tot_c,
+                    value=min(10.0, saldo_tot_c),
+                    step=0.5
+                )
+                costo_fifo_serv, plan_desc, faltante_fifo = calcular_fifo_bodega(
+                    df_bodega, "Concentrado", t_conc_sel, pres_serv, und_serv, kg_serv, contenido_unidad=cont_serv
+                )
 
                 if st.button("💾 Descontar Alimento (FIFO) y Cargar Costo"):
-                    if faltante_fifo > 0 or kg_serv > saldo_tot_c:
+                    if faltante_fifo > 1e-4 or kg_serv > saldo_tot_c:
                         st.error("🚫 Saldo insuficiente en bodega para cubrir esa cantidad.")
                     else:
                         for idx, nuevo_s in plan_desc:
@@ -1464,14 +1525,12 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
                         if dest_tipo == "Lote de Engorde":
                             df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == id_dest, "Kg_Alimento_Consumido"] = to_num(df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == id_dest, "Kg_Alimento_Consumido"]) + kg_serv
                             df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == id_dest, "Costo_Alimento"] = to_num(df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == id_dest, "Costo_Alimento"]) + costo_fifo_serv
-                            guardar_hoja("Lotes_Engorde", df_lotes)
+                            guardar_hojas_seguro([("Bodega", df_bodega), ("Consumo_Alimento", df_consumo), ("Lotes_Engorde", df_lotes)])
                         else:
                             df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == id_dest, "Costo_Acumulado_Ciclo"] = to_num(df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == id_dest, "Costo_Acumulado_Ciclo"]) + costo_fifo_serv
-                            guardar_hoja("Reproductores", df_rep)
+                            guardar_hojas_seguro([("Bodega", df_bodega), ("Consumo_Alimento", df_consumo), ("Reproductores", df_rep)])
 
-                        guardar_hoja("Bodega", df_bodega)
-                        guardar_hoja("Consumo_Alimento", df_consumo)
-                        st.success(f"Descontados {kg_serv} kg de {t_conc_sel} (Costo FIFO: ${costo_fifo_serv:,.0f}).")
+                        st.success(f"Descontados {kg_serv} {und_serv} de {t_conc_sel} (Costo FIFO: ${costo_fifo_serv:,.0f}).")
                         st.rerun()
 
     with tab_b3:
@@ -1479,14 +1538,14 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
         cat_ins = st.selectbox("Categoría de Insumo", ["Concentrado", "Antibiótico / Inyectable", "Vacuna / Biológico", "Vitamina / Desparasitante"])
         if cat_ins == "Concentrado":
             nom_ins = st.selectbox("Tipo de Concentrado", LISTA_CONCENTRADOS)
-            pres = "Bulto"
+            pres = st.selectbox("Presentación", ["Bulto", "Saco", "Granel"])
             und_med = "kg"
-            cont_und = st.number_input("Kilos por Bulto", min_value=1.0, value=40.0)
+            cont_und = st.number_input("Kilos por Unidad / Bulto", min_value=1.0, value=40.0, step=1.0)
         else:
             nom_ins = st.text_input("Nombre del Medicamento / Vacuna", placeholder="Ej: Florfenicol Inyectable 30%")
             pres = st.selectbox("Presentación", ["Frasco", "Caja / Dosis", "Sobre / Bolsa"])
             und_med = st.selectbox("Unidad de Descuento", ["ml", "dosis", "g"])
-            cont_und = st.number_input(f"Contenido por {pres} ({und_med})", min_value=1.0, value=100.0)
+            cont_und = st.number_input(f"Contenido por {pres} ({und_med})", min_value=1.0, value=100.0, step=1.0)
 
         cant_comp = st.number_input(f"Cantidad de {pres}s comprados", min_value=1, value=1)
         precio_u = st.number_input(f"Precio de Compra por {pres} ($)", min_value=0.0, value=85000.0, step=1000.0)
@@ -1517,22 +1576,21 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
                 st.rerun()
 
     st.divider()
-    st.subheader("📊 Resumen Ponderado de Bodega y Botiquín (Sin Mezclar Unidades)")
+    st.subheader("📊 Resumen Ponderado de Bodega y Botiquín")
     if not df_bodega.empty:
         df_bodega["Saldo_Num"] = to_num(df_bodega["Saldo_Disponible"])
         df_bodega["Valor_Fila"] = df_bodega["Saldo_Num"] * to_num(df_bodega["Costo_Por_Medida"])
-        res_bod = df_bodega.groupby(["Categoria_Insumo", "Nombre_Insumo", "Presentacion", "Unidad_Medida"], as_index=False).agg(
+        res_bod = df_bodega.groupby(["Categoria_Insumo", "Nombre_Insumo", "Presentacion", "Contenido_Por_Unidad", "Unidad_Medida"], as_index=False).agg(
             Saldo_Total=("Saldo_Num", "sum"),
-            Tam_Envase=("Contenido_Por_Unidad", "last"),
             Valor_Total_Stock=("Valor_Fila", "sum")
         )
-        res_bod["Unidades / Bultos"] = (res_bod["Saldo_Total"] / res_bod["Tam_Envase"].replace(0, 1)).round(2)
+        res_bod["Unidades / Bultos"] = (res_bod["Saldo_Total"] / to_num(res_bod["Contenido_Por_Unidad"]).replace(0, 1)).round(2)
         res_bod["Costo_Ponderado_Real ($)"] = np.where(res_bod["Saldo_Total"] > 0, (res_bod["Valor_Total_Stock"] / res_bod["Saldo_Total"]).round(2), 0.0)
         if es_admin:
             res_bod["Valor_Total_Stock"] = res_bod["Valor_Total_Stock"].round(0)
-            cols_v = ["Categoria_Insumo", "Nombre_Insumo", "Presentacion", "Saldo_Total", "Unidad_Medida", "Unidades / Bultos", "Costo_Ponderado_Real ($)", "Valor_Total_Stock"]
+            cols_v = ["Categoria_Insumo", "Nombre_Insumo", "Presentacion", "Contenido_Por_Unidad", "Saldo_Total", "Unidad_Medida", "Unidades / Bultos", "Costo_Ponderado_Real ($)", "Valor_Total_Stock"]
         else:
-            cols_v = ["Categoria_Insumo", "Nombre_Insumo", "Presentacion", "Saldo_Total", "Unidad_Medida", "Unidades / Bultos"]
+            cols_v = ["Categoria_Insumo", "Nombre_Insumo", "Presentacion", "Contenido_Por_Unidad", "Saldo_Total", "Unidad_Medida", "Unidades / Bultos"]
         st.dataframe(res_bod[cols_v], use_container_width=True, hide_index=True)
 
 # ==============================================================================
@@ -1541,7 +1599,7 @@ elif menu == "🌾 Bodega, Arqueo y Botiquín":
 elif menu == "💉 Sanidad y Mortalidad":
     st.markdown('<div class="main-header">💉 Sanidad, Botiquín y Control de Mortalidad</div>', unsafe_allow_html=True)
 
-    reproductores_vivos_ids = opciones_limpias(df_rep[~df_rep["Estado"].astype(str).str.strip().isin(ESTADOS_INACTIVOS_REP)]["ID_Animal"]) if not df_rep.empty else []
+    reproductores_vivos_ids = opciones_limpias(reproductores_activos_df["ID_Animal"]) if not reproductores_activos_df.empty else []
     destinos_posibles = opciones_limpias(lotes_activos["ID_Lote"]) + reproductores_vivos_ids
     meds_disp = df_bodega[(df_bodega["Categoria_Insumo"].astype(str).str.strip() != "Concentrado") & (to_num(df_bodega["Saldo_Disponible"]) > 0)].copy() if not df_bodega.empty else pd.DataFrame()
 
@@ -1562,17 +1620,25 @@ elif menu == "💉 Sanidad y Mortalidad":
             if not meds_disp.empty:
                 usar_botiquin = st.checkbox("💊 Descontar medicamento del Botiquín en Bodega", value=True)
             if usar_botiquin and not meds_disp.empty:
-                meds_disp["Clave_Med"] = meds_disp["Nombre_Insumo"].astype(str).str.strip() + " | " + meds_disp["Presentacion"].astype(str).str.strip() + " (" + meds_disp["Unidad_Medida"].astype(str).str.strip() + ")"
-                clave_med_sel = c2.selectbox("Medicamento Exacto (Nombre | Presentación | Unidad)", opciones_limpias(meds_disp["Clave_Med"]))
+                meds_disp["Clave_Med"] = (
+                    meds_disp["Nombre_Insumo"].astype(str).str.strip() + " | " +
+                    meds_disp["Presentacion"].astype(str).str.strip() + " | " +
+                    meds_disp["Contenido_Por_Unidad"].astype(str).str.strip() + " " +
+                    meds_disp["Unidad_Medida"].astype(str).str.strip()
+                )
+                clave_med_sel = c2.selectbox("Medicamento Exacto (Nombre | Presentación | Contenido)", opciones_limpias(meds_disp["Clave_Med"]))
                 sub_m = meds_disp[meds_disp["Clave_Med"] == clave_med_sel]
                 med_nombre = str(sub_m.iloc[0]["Nombre_Insumo"]).strip()
                 med_pres = str(sub_m.iloc[0]["Presentacion"]).strip()
                 unidad_ap = str(sub_m.iloc[0]["Unidad_Medida"]).strip()
                 cat_med = str(sub_m.iloc[0]["Categoria_Insumo"]).strip()
+                cont_med = float(to_num(pd.Series([sub_m.iloc[0]["Contenido_Por_Unidad"]])).iloc[0])
                 saldo_m = float(to_num(sub_m["Saldo_Disponible"]).sum())
 
                 cant_aplicada = c1.number_input(f"Cantidad Aplicada ({unidad_ap}) [Máx: {saldo_m:.2f}]", min_value=min(0.1, saldo_m), max_value=saldo_m, value=min(5.0, saldo_m), step=0.5)
-                costo_san, plan_desc_med, _ = calcular_fifo_bodega(df_bodega, cat_med, med_nombre, med_pres, unidad_ap, cant_aplicada)
+                costo_san, plan_desc_med, _ = calcular_fifo_bodega(
+                    df_bodega, cat_med, med_nombre, med_pres, unidad_ap, cant_aplicada, contenido_unidad=cont_med
+                )
                 if es_admin:
                     st.info(f"Costo exacto FIFO a cargar: **${costo_san:,.0f}**")
             else:
@@ -1586,10 +1652,11 @@ elif menu == "💉 Sanidad y Mortalidad":
         f_fin_ret = (hoy + timedelta(days=int(dias_ret))).strftime("%Y-%m-%d") if dias_ret > 0 else ""
 
         if st.button("💾 Registrar Evento Sanitario"):
+            hojas_a_guardar = []
             if usar_botiquin and cant_aplicada > 0:
                 for idx, nuevo_s in plan_desc_med:
                     df_bodega.at[idx, "Saldo_Disponible"] = nuevo_s
-                guardar_hoja("Bodega", df_bodega)
+                hojas_a_guardar.append(("Bodega", df_bodega))
 
             nuevo_san = pd.DataFrame([{
                 "Fecha": hoy.strftime("%Y-%m-%d"),
@@ -1605,27 +1672,27 @@ elif menu == "💉 Sanidad y Mortalidad":
                 "Estado_Caso": "En Tratamiento" if dias_ret > 0 else "Cerrado"
             }])
             df_sanidad = pd.concat([df_sanidad, nuevo_san], ignore_index=True)
+            hojas_a_guardar.append(("Sanidad_Eventos", df_sanidad))
 
             if not lotes_activos.empty and dest_san in opciones_limpias(lotes_activos["ID_Lote"]):
                 if cat_san == "Mortalidad (Baja)":
                     df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == dest_san, "Cant_Actual"] = (to_num(df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == dest_san, "Cant_Actual"]) - 1).clip(lower=0)
                 df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == dest_san, "Costo_Sanidad"] = to_num(df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == dest_san, "Costo_Sanidad"]) + costo_san
-                guardar_hoja("Lotes_Engorde", df_lotes)
+                hojas_a_guardar.append(("Lotes_Engorde", df_lotes))
             elif dest_san in reproductores_vivos_ids:
                 if cat_san == "Mortalidad (Baja)":
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == dest_san, "Estado"] = "Muerta"
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == dest_san, "Banda"] = "N/A"
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == dest_san, "Fecha_Ultimo_Cambio_Estado"] = hoy.strftime("%Y-%m-%d")
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == dest_san, "Observaciones"] = f"Fallecida el {hoy.strftime('%Y-%m-%d')}: {sintoma}"
-                    # Cerrar eventos reproductivos abiertos de esa cerda
                     if not df_repro.empty:
                         df_repro.loc[(df_repro["ID_Cerda"].astype(str).str.strip() == dest_san) & (df_repro["Estado_Prenez"].astype(str).str.strip().isin(["Pendiente Eco", "Preñada", "En Lactancia"])), "Estado_Prenez"] = "Muerte Madre"
-                        guardar_hoja("Reproduccion", df_repro)
+                        hojas_a_guardar.append(("Reproduccion", df_repro))
                 else:
                     df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == dest_san, "Costo_Acumulado_Ciclo"] = to_num(df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == dest_san, "Costo_Acumulado_Ciclo"]) + costo_san
-                guardar_hoja("Reproductores", df_rep)
+                hojas_a_guardar.append(("Reproductores", df_rep))
 
-            guardar_hoja("Sanidad_Eventos", df_sanidad)
+            guardar_hojas_seguro(hojas_a_guardar)
             st.success("Evento sanitario registrado e inventarios actualizados.")
             st.rerun()
 
@@ -1664,10 +1731,12 @@ elif menu == "💰 Ventas (Marranos / Cuido)":
         else:
             c1, c2 = st.columns(2)
             conc_v = conc_v.copy()
-            conc_v["_ClaveVenta"] = (conc_v["Nombre_Insumo"].astype(str).str.strip() + " | " +
-                                    conc_v["Presentacion"].astype(str).str.strip() + " | " +
-                                    conc_v["Contenido_Por_Unidad"].astype(str).str.strip() + " " +
-                                    conc_v["Unidad_Medida"].astype(str).str.strip())
+            conc_v["_ClaveVenta"] = (
+                conc_v["Nombre_Insumo"].astype(str).str.strip() + " | " +
+                conc_v["Presentacion"].astype(str).str.strip() + " | " +
+                conc_v["Contenido_Por_Unidad"].astype(str).str.strip() + " " +
+                conc_v["Unidad_Medida"].astype(str).str.strip()
+            )
             clave_v = c1.selectbox("Concentrado / presentación a vender", opciones_limpias(conc_v["_ClaveVenta"]))
             sub_pv = conc_v[conc_v["_ClaveVenta"] == clave_v]
             prod_v = str(sub_pv.iloc[0]["Nombre_Insumo"]).strip()
@@ -1677,15 +1746,16 @@ elif menu == "💰 Ventas (Marranos / Cuido)":
             saldo_kg_v = float(to_num(sub_pv["Saldo_Disponible"]).sum())
             max_bultos_v = saldo_kg_v / max(tam_b_v, 1.0)
 
-            bultos_v = c2.number_input("Cantidad de Bultos a Vender", min_value=min(0.1, max_bultos_v), max_value=max_bultos_v, value=min(1.0, max_bultos_v), step=0.25)
+            bultos_v = c2.number_input("Cantidad de Bultos / Unidades a Vender", min_value=min(0.1, max_bultos_v), max_value=max_bultos_v, value=min(1.0, max_bultos_v), step=0.25)
             kilos_v = round(bultos_v * tam_b_v, 2)
 
-            # Cálculo FIFO exacto ANTES de confirmar (coincide 100% con el guardado)
-            costo_fifo_venta, plan_desc_venta, _ = calcular_fifo_bodega(df_bodega, "Concentrado", prod_v, pres_v, unidad_v, kilos_v)
+            costo_fifo_venta, plan_desc_venta, _ = calcular_fifo_bodega(
+                df_bodega, "Concentrado", prod_v, pres_v, unidad_v, kilos_v, contenido_unidad=tam_b_v
+            )
             costo_bulto_fifo = costo_fifo_venta / max(bultos_v, 0.0001)
 
             margen_pct = c1.number_input("Margen Comercial (%) [Sugerido: 18%]", min_value=0.0, max_value=100.0, value=float(MARGEN_CUIDO_DEFAULT), step=1.0)
-            costo_flete_v = c2.number_input("Costo Flete / Transporte Asumido ($)", min_value=0.0, value=0.0, step=5000.0)
+            costo_flete_v = c2.number_input("Costo Flete Adicional Asumido (no registrado en gastos) ($)", min_value=0.0, value=0.0, step=5000.0)
             cliente_txt = st.text_input("Cliente / Finca Destino", placeholder="Ej: Finca El Roble")
 
             precio_venta_bulto = costo_bulto_fifo * (1 + margen_pct / 100.0)
@@ -1715,14 +1785,12 @@ elif menu == "💰 Ventas (Marranos / Cuido)":
                     "Utilidad_Neta": utilidad_n_cuido
                 }])
                 df_ventas = pd.concat([df_ventas, nueva_vc], ignore_index=True)
-                guardar_hoja("Bodega", df_bodega)
-                guardar_hoja("Ventas", df_ventas)
+                guardar_hojas_seguro([("Bodega", df_bodega), ("Ventas", df_ventas)])
                 st.success(f"Venta registrada con utilidad exacta de ${utilidad_n_cuido:,.0f}.")
                 st.rerun()
 
     elif "Descarte" in linea_venta:
         st.subheader("🐷 Venta de Cerda de Descarte")
-        # Bloquea venta de cerdas Preñadas, Lactantes o con ciclo activo
         hembras_elegibles_desc = hembras_activas_df[
             (hembras_activas_df["Estado"].astype(str).str.strip() == "Vacía") &
             (~hembras_activas_df["ID_Animal"].astype(str).str.strip().isin(cerdas_con_ciclo_abierto))
@@ -1764,8 +1832,7 @@ elif menu == "💰 Ventas (Marranos / Cuido)":
                 df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_d, "Banda"] = "N/A"
                 df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_d, "Fecha_Ultimo_Cambio_Estado"] = hoy.strftime("%Y-%m-%d")
                 df_rep.loc[df_rep["ID_Animal"].astype(str).str.strip() == cerda_d, "Observaciones"] = f"Vendida por descarte el {hoy.strftime('%Y-%m-%d')}"
-                guardar_hoja("Ventas", df_ventas)
-                guardar_hoja("Reproductores", df_rep)
+                guardar_hojas_seguro([("Ventas", df_ventas), ("Reproductores", df_rep)])
                 st.success(f"Cerda {cerda_d} vendida y retirada del inventario activo.")
                 st.rerun()
 
@@ -1852,8 +1919,7 @@ elif menu == "💰 Ventas (Marranos / Cuido)":
                     df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_v, "Costo_Alimento"] = round(float(to_num(pd.Series([fila_v["Costo_Alimento"]])).iloc[0]) * ratio_rem, 0)
                     df_lotes.loc[df_lotes["ID_Lote"].astype(str).str.strip() == lote_v, "Costo_Sanidad"] = round(float(to_num(pd.Series([fila_v["Costo_Sanidad"]])).iloc[0]) * ratio_rem, 0)
 
-                guardar_hoja("Ventas", df_ventas)
-                guardar_hoja("Lotes_Engorde", df_lotes)
+                guardar_hojas_seguro([("Ventas", df_ventas), ("Lotes_Engorde", df_lotes)])
                 st.success("Venta registrada y costos prorrateados correctamente.")
                 st.rerun()
 
@@ -1889,32 +1955,25 @@ elif menu == "📊 Analítica, Metas y Reportes":
         fig_curva.update_layout(xaxis_title="Edad del Cerdo (Días)", yaxis_title="Peso Promedio (kg)", height=430)
         st.plotly_chart(fig_curva, use_container_width=True)
 
-    # Cálculo de KPIs reproductivos y mortalidad globales para Analítica y Reportes
     partos_realizados = df_repro[to_num(df_repro["Nacidos_Vivos"]) > 0] if not df_repro.empty else pd.DataFrame()
     total_partos = len(partos_realizados)
     prom_nacidos_vivos = float(to_num(partos_realizados["Nacidos_Vivos"]).mean()) if total_partos > 0 else 0.0
     destetados_df = df_repro[to_num(df_repro["Destetados_Reales"]) > 0] if not df_repro.empty else pd.DataFrame()
     prom_destetados = float(to_num(destetados_df["Destetados_Reales"]).mean()) if not destetados_df.empty else 0.0
-    tot_servicios = len(df_repro) if not df_repro.empty else 0
-    tot_repeticiones = int(to_num(df_rep["Repeticiones"]).sum()) if not df_rep.empty else 0
-    tot_abortos = int(to_num(df_rep["Abortos"]).sum()) if not df_rep.empty else 0
 
-    # Indicador por cohorte de servicio: se excluyen eventos aún pendientes de diagnóstico.
     estados_diagnosticados = ["Preñada", "Repitió Celo", "Aborto", "En Lactancia", "Destetada", "Muerte Madre"]
     servicios_diagnosticados = df_repro[df_repro["Estado_Prenez"].astype(str).str.strip().isin(estados_diagnosticados)] if not df_repro.empty else pd.DataFrame()
     estados_confirmacion = ["Preñada", "Aborto", "En Lactancia", "Destetada", "Muerte Madre"]
     servicios_confirmados = servicios_diagnosticados[servicios_diagnosticados["Estado_Prenez"].astype(str).str.strip().isin(estados_confirmacion)] if not servicios_diagnosticados.empty else pd.DataFrame()
     tasa_prenez_pct = (len(servicios_confirmados) / len(servicios_diagnosticados) * 100.0) if not servicios_diagnosticados.empty else 0.0
 
-    # La base no permite calcular una tasa de mortalidad por cohorte fiable (no separa
-    # mortalidades de ventas ni vincula bajas a edad/parto); mostramos conteo verificable.
     bajas_lotes = int(df_sanidad["Categoria"].astype(str).str.contains("Mortalidad", na=False).sum()) if not df_sanidad.empty else 0
 
     with tab_a2:
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("🐷 Partos Registrados", total_partos, delta=f"Prom. Nac. Vivos: {prom_nacidos_vivos:.1f}")
         k2.metric("🍼 Prom. Destetados", f"{prom_destetados:.1f} lechones")
-        k3.metric("🎯 Preñez confirmada / servicios diagnosticados", f"{tasa_prenez_pct:.1f}%", delta=f"Diagn.: {len(servicios_diagnosticados)} | Confirm.: {len(servicios_confirmados)}")
+        k3.metric("🎯 Preñez confirmada / diagnosticados", f"{tasa_prenez_pct:.1f}%", delta=f"Diagn.: {len(servicios_diagnosticados)} | Confirm.: {len(servicios_confirmados)}")
         k4.metric("📉 Mortalidades registradas", f"{bajas_lotes}")
 
     with tab_a3:
@@ -2020,7 +2079,7 @@ elif menu == "📊 Analítica, Metas y Reportes":
             st.download_button(
                 label="📘 Descargar Informe Integral en Word (.docx)",
                 data=generar_word(),
-                file_name=f"Reporte_PorciGestion_v2_{hoy.strftime('%Y%m%d')}.docx",
+                file_name=f"Reporte_PorciGestion_v3_{hoy.strftime('%Y%m%d')}.docx",
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True
             )
@@ -2028,7 +2087,7 @@ elif menu == "📊 Analítica, Metas y Reportes":
             st.download_button(
                 label="📕 Descargar Informe Integral en PDF (.pdf)",
                 data=generar_pdf(),
-                file_name=f"Reporte_PorciGestion_v2_{hoy.strftime('%Y%m%d')}.pdf",
+                file_name=f"Reporte_PorciGestion_v3_{hoy.strftime('%Y%m%d')}.pdf",
                 mime="application/pdf",
                 use_container_width=True
             )
